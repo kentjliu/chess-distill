@@ -15,15 +15,21 @@ def parse_pgn_and_generate_pairs(pgn_path):
             game = chess.pgn.read_game(f)
             if game is None:
                 break  # End of file
+
+            # Get Chess960 starting position from PGN
+            if "FEN" in game.headers:
+                start_fen = game.headers["FEN"]
+                board = chess.Board(fen=start_fen)  # Initialize board with Chess 960 position
+            else:
+                board = chess.Board()  # Default to standard chess if no FEN is provided
             
-            board = chess.Board()  # Start new game
             for move in game.mainline_moves():
                 if board.is_game_over():
                     break  # Stop if game is over
-                
+
                 state = board.fen()  # Get board state as FEN
                 state_action_pairs.append(f"{state} {move.uci()}")  # Store state and action
-                
+
                 board.push(move)  # Apply move
                 
     return state_action_pairs
