@@ -41,6 +41,7 @@ for filename in os.listdir(pgn_dir):
         pgn_path = os.path.join(pgn_dir, filename)
         all_pairs.extend(parse_pgn_and_generate_pairs(pgn_path))
         print(f"Processed: {filename}")
+        break
 
 # Save training data
 with open(training_data_file, "w", encoding="utf-8") as f:
