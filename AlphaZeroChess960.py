@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --- Chess960 game definition ---
 class Chess960Game:
     def __init__(self):
-        #initialize board
+        # 8x8 board, action = from_square(0-63) * 64 + to_square(0-63)
         self.board_size = 8
         self.action_size = self.board_size * self.board_size
         self.action_size = self.action_size * self.action_size  # 64*64
@@ -22,21 +22,19 @@ class Chess960Game:
         idx = random.randint(0, 959)
         return chess.Board.from_chess960_pos(idx)
 
-    def get_valid_moves(self, board: chess.Board):
+    def get_valid_moves(self, board: chess.Board) -> np.ndarray:
         mask = np.zeros(self.action_size, dtype=np.uint8)
         for move in board.legal_moves:
             idx = move.from_square * 64 + move.to_square
             mask[idx] = 1
         return mask
-    
-    #Returns new board
-    def get_next_state(self, board: chess.Board, action: int):
+
+    def get_next_state(self, board: chess.Board, action: int) -> chess.Board:
         from_sq = action // 64
         to_sq   = action % 64
         new_board = board.copy()
         piece = new_board.piece_at(from_sq)
-        '''All of this was written because
-        it kept trying illegal moves. This fixed it'''
+
         # Try the normal move first
         plain = chess.Move(from_sq, to_sq)
         if plain in new_board.legal_moves:
@@ -54,9 +52,8 @@ class Chess960Game:
 
         # Otherwise it really is illegal
         raise ValueError(f"Illegal action {plain} (or promotion) on position:\n{board.fen()}")
-    
-    #The tree traversers until a draw/win/or loss then terminates and propagates this back upwards
-    def get_value_and_terminated(self, board: chess.Board):
+
+    def get_value_and_terminated(self, board: chess.Board) -> (float, bool):
         if board.is_checkmate():
             # winner is opponent of current turn
             winner = board.turn ^ True
@@ -65,23 +62,20 @@ class Chess960Game:
         if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
             return 0.0, True
         return 0.0, False
-    
-    #return's oppenents value. since this is an adversarial game it is just our negative value
-    def get_opponent_value(self, value: float):
+
+    def get_opponent_value(self, value: float) -> float:
         return -value
 
-    #change perspective i.e flips board
-    def change_perspective(self, board: chess.Board):
+    def change_perspective(self, board: chess.Board) -> chess.Board:
         # rotate board so that current player is always white in encoding
         # swap white/black pieces
         flipped = board.mirror()
         flipped.turn = True
         return flipped
 
-
     def get_encoded_state(self, board: chess.Board) -> np.ndarray:
         # 12x8x8 planes: white P,N,B,R,Q,K and black P,N,B,R,Q,K
-        encoded = np.zeros((12, 8, 8), dtype=np.float32)
+        encoded = np.zeros((18, 8, 8), dtype=np.float32)
         for sq in chess.SQUARES:
             piece = board.piece_at(sq)
             if piece:
@@ -94,9 +88,6 @@ class Chess960Game:
         return encoded
 
 # --- Neural network definition ---
-# We need a policy creator 
-# We are using hybrid approach where we pretrain a model, so we will load said model in by loading it's weights into this model. 
-#THE POLICY MODEL AND OUR MODEL NEED TO BE IDENTICAL IN TERMS OF PARAMETERS OR THIS WILL BREAK
 class ResBlock(nn.Module):
     def __init__(self, num_hidden):
         super().__init__()
@@ -112,15 +103,16 @@ class ResBlock(nn.Module):
         return F.relu(x + residual)
 
 class ResNet(nn.Module):
-    def __init__(self, game: Chess960Game, num_resBlocks=4, num_hidden=128):
+    def __init__(self, game: Chess960Game, num_input_planes=18, num_resBlocks=4, num_hidden=128):
         super().__init__()
+        # updated input layer to accept 18 channels
         self.startBlock = nn.Sequential(
-            nn.Conv2d(12, num_hidden, kernel_size=3, padding=1),
+            nn.Conv2d(num_input_planes, num_hidden, kernel_size=3, padding=1),
             nn.BatchNorm2d(num_hidden),
             nn.ReLU()
         )
         self.backBone = nn.ModuleList([ResBlock(num_hidden) for _ in range(num_resBlocks)])
-        # policy head
+        # policy head outputs 4096 logits
         self.policyHead = nn.Sequential(
             nn.Conv2d(num_hidden, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -145,7 +137,6 @@ class ResNet(nn.Module):
         return self.policyHead(x), self.valueHead(x)
 
 # --- MCTS with neural guidance ---
-#node class ->functions as you would expect a MCTS node
 class Node:
     def __init__(self, game, state, parent=None, prior=0.0):
         self.game = game
@@ -162,7 +153,7 @@ class Node:
     def expand(self, policy):
         for a, p in enumerate(policy):
             if p > 0:
-                self.children[a] = Node(self.game, 
+                self.children[a] = Node(self.game,
                                         self.game.get_next_state(self.state, a),
                                         parent=self,
                                         prior=p)
@@ -208,9 +199,9 @@ class MCTS:
         # dirichlet noise
         noise = np.random.dirichlet([self.args['dirichlet_alpha']] * self.game.action_size)
         policy = (1 - self.args['epsilon']) * policy + self.args['epsilon'] * noise
-        valid  = self.game.get_valid_moves(state)   
-        policy = policy * valid                      
-        policy = policy / np.sum(policy)  
+        valid  = self.game.get_valid_moves(state)
+        policy = policy * valid
+        policy = policy / np.sum(policy)
         root.expand(policy)
 
         for _ in range(self.args['num_searches']):
@@ -247,7 +238,6 @@ class AlphaZero:
         self.args = args
         self.mcts = MCTS(game, model, args,self.device)
 
-    #Self play Training policy
     def self_play(self):
         memory = []
         board = self.game.get_initial_state()
@@ -271,9 +261,9 @@ class AlphaZero:
 
             print(f"⮕ Player {'White' if player_turn else 'Black'} plays {move.uci()}")
             print("   FEN before move:", state.fen())
-            
+
             board = self.game.get_next_state(board, action)
-            
+
             print("   FEN after  move:", board.fen(), "\n")
 
             memory.append((state, probs, player_turn))
@@ -301,7 +291,7 @@ class AlphaZero:
             loss_v = F.mse_loss(val, vs)
             (loss_p + loss_v).backward()
             self.optimizer.step()
-    #Learning File
+
     def learn(self):
         for it in range(self.args['num_iterations']):
             memory = []
@@ -315,21 +305,18 @@ class AlphaZero:
 if __name__ == '__main__':
     game = Chess960Game()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #The model will need to be updated to be our pretrained model
     model = ResNet(game).to(device)
-    #Need to load pretrained models parameter into model
-        
+    checkpoint = torch.load('/content/model_parameters.pth', map_location=device)
+    model.load_state_dict(checkpoint, strict=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    #Modify args when we train for real
     args = {
-        'C': 1.4,
-        'num_searches': 200,
-        'epsilon': 0.25,
-        'dirichlet_alpha': 0.03,
-        'batch_size': 64,
-        'num_iterations': 10,
-        'num_selfplay': 100
+        'C':              1.4,
+        'num_searches':   5,   # ← very few rollouts per move
+        'epsilon':       0.25,
+        'dirichlet_alpha':0.03,
+        'batch_size':    64,   # ↓ smaller batch, less training work
+        'num_iterations': 1,   # ← only one cycle
+        'num_selfplay':   1    # ← only one self‐play game
     }
     az = AlphaZero(model, optimizer, game, args, device)
     az.learn()
