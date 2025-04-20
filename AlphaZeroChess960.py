@@ -301,7 +301,7 @@ class AlphaZero:
             loss_v = F.mse_loss(val, vs)
             (loss_p + loss_v).backward()
             self.optimizer.step()
-
+    #Learning File
     def learn(self):
         for it in range(self.args['num_iterations']):
             memory = []
