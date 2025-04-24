@@ -1,0 +1,5 @@
+chess==1.10.0
+numpy==1.21.6
+Requests==2.32.3
+torch==1.13.1
+zstandard==0.21.0
