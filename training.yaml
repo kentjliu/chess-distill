@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+name: rl-training-deployment
+spec:
+  replicas: 1
+  selector:
+    matchlabels:
+      app: training
+  template:
+    metadata:
+      labels:
+        app: training
+    spec:
+      #put in node name
+      nodeName: #TBD
+
+    containers:
+    - name: training-container
+      image: #TBD
+
+      volumneMounts:
+      - name: model-volume
+        mountPath: /model
+      
+      resources:
+        limits:
+          nvidia.com/gpu: 1 #change if need more
+
+      volumes:
+      - name: model-volume
+        persistentVolumeClaim:
+          claimName: pvc-model-bucket
+          
