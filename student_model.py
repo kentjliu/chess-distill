@@ -14,7 +14,7 @@ from AlphaZeroChess960 import Chess960Game
 
 
 
-teacher_path = "policy_model.pth" # change to saved teacher model path
+teacher_path = "policy.pth" # change to saved teacher model path
 
 class ResBlock(nn.Module):
     def __init__(self, num_hidden):
