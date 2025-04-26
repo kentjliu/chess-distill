@@ -1,3 +1,6 @@
+# Made with help of Claude
+
+
 import chess
 import random
 import math
