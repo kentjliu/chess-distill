@@ -11,6 +11,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from policy_model import ChessPolicyNet, encode_fen
 from AlphaZeroChess960 import Chess960Game
+import wandb
+import torch.profiler
+import glob
 
 teacher_path = "policy.pth" # change to saved teacher model path
 
@@ -121,7 +124,31 @@ class Distiller:
         
         return loss.item()
     
-    def distill(self, dataset, batch_size=64, epochs=10):
+    def distill(self, dataset, batch_size=64, epochs=10, profile=False):
+        # Initialize wandb for experiment tracking
+        wandb.init(project="chess-distillation", 
+                  config={
+                      "temperature": self.temperature,
+                      "batch_size": batch_size,
+                      "epochs": epochs,
+                      "student_res_blocks": len(self.student_model.backBone),
+                      "student_hidden_dim": self.student_model.startBlock[0].out_channels
+                  })
+        
+        # Log model architecture
+        wandb.watch(self.student_model, log="all", log_freq=10)
+        
+        # Setup profiler
+        profile_dir = "tbprofile/"
+        
+        # Create profiler schedule
+        schedule = torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=1
+        )
+        
         for epoch in range(epochs):
             total_loss = 0
             batches = 0
@@ -129,21 +156,135 @@ class Distiller:
             # Shuffle dataset
             indices = torch.randperm(len(dataset))
             
-            for i in range(0, len(dataset), batch_size):
-                batch_indices = indices[i:i+batch_size]
-                states = [dataset[idx][0] for idx in batch_indices]
-                fens = [dataset[idx][1] for idx in batch_indices]
-                states = np.stack(states)
+            # Profile first epoch to get FLOPs and model statistics
+            if epoch == 0 and profile:
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    schedule=schedule,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_flops=True,
+                    with_stack=True
+                ) as prof:
+                    # Process a few batches with profiling
+                    for i in range(0, min(5 * batch_size, len(dataset)), batch_size):
+                        batch_indices = indices[i:i+batch_size]
+                        states = [dataset[idx][0] for idx in batch_indices]
+                        fens = [dataset[idx][1] for idx in batch_indices]
+                        states = np.stack(states)
+                        
+                        loss = self.train_batch(states, fens)
+                        total_loss += loss
+                        batches += 1
+                        
+                        prof.step()
                 
-                loss = self.train_batch(states, fens)
-                total_loss += loss
-                batches += 1
+                # Create a wandb Artifact for the profile
+                profile_art = wandb.Artifact("trace", type="profile")
+                
+                # Add the trace files to the Artifact
+                for trace_file in glob.glob(profile_dir + "*.pt.trace.json"):
+                    profile_art.add_file(trace_file)
+                
+                # Log the artifact
+                wandb.log_artifact(profile_art)
+                
+                # Print profiler results
+                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+                flops_table = prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=20)
+                print(flops_table)
+                
+                # Process remaining batches without profiling
+                for i in range(5 * batch_size, len(dataset), batch_size):
+                    batch_indices = indices[i:i+batch_size]
+                    states = [dataset[idx][0] for idx in batch_indices]
+                    fens = [dataset[idx][1] for idx in batch_indices]
+                    states = np.stack(states)
+                    
+                    loss = self.train_batch(states, fens)
+                    total_loss += loss
+                    batches += 1
+            else:
+                # Regular training without profiling
+                for i in range(0, len(dataset), batch_size):
+                    batch_indices = indices[i:i+batch_size]
+                    states = [dataset[idx][0] for idx in batch_indices]
+                    fens = [dataset[idx][1] for idx in batch_indices]
+                    states = np.stack(states)
+                    
+                    loss = self.train_batch(states, fens)
+                    total_loss += loss
+                    batches += 1
             
             avg_loss = total_loss / batches
             print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}")
             
+            # Log metrics to wandb
+            wandb.log({
+                "epoch": epoch + 1,
+                "avg_loss": avg_loss,
+            })
+            
             # Save checkpoint
-            torch.save(self.student_model.state_dict(), f"student_model_epoch_{epoch+1}.pt")
+            checkpoint_path = f"student_model_epoch_{epoch+1}.pt"
+            torch.save(self.student_model.state_dict(), checkpoint_path)
+            
+            # Log model checkpoint to wandb
+            model_artifact = wandb.Artifact(f"model-epoch-{epoch+1}", type="model")
+            model_artifact.add_file(checkpoint_path)
+            wandb.log_artifact(model_artifact)
+        
+        # Close wandb run
+        wandb.finish()
+
+def profile_models(teacher_model, student_model, device):
+    """Profile both models to compare FLOPs and parameters"""
+    # Create sample input
+    sample_input = torch.randn(1, 18, 8, 8, device=device)
+    
+    # Profile teacher model
+    print("Profiling teacher model...")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_flops=True
+    ) as prof_teacher:
+        # Forward pass with teacher
+        teacher_model(sample_input)
+    
+    teacher_stats = prof_teacher.key_averages()
+    
+    # Profile student model
+    print("Profiling student model...")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_flops=True
+    ) as prof_student:
+        # Forward pass with student
+        student_model(sample_input)
+    
+    student_stats = prof_student.key_averages()
+    
+    # Print comparison
+    print("\nModel Comparison:")
+    print(f"Teacher total FLOPs: {sum(k.flops for k in teacher_stats if k.flops > 0)}")
+    print(f"Student total FLOPs: {sum(k.flops for k in student_stats if k.flops > 0)}")
+    print(f"Reduction: {(1 - sum(k.flops for k in student_stats if k.flops > 0) / sum(k.flops for k in teacher_stats if k.flops > 0)) * 100:.2f}%")
+    
+    return teacher_stats, student_stats
 
 def main():
     # Initialize game
@@ -158,6 +299,9 @@ def main():
     
     # Create student model (smaller)
     student_model = StudentModel(game, num_resBlocks=2, num_hidden=64).to(device)
+    
+    # Profile both models before training
+    teacher_stats, student_stats = profile_models(teacher_model, student_model, device)
     
     # Initialize optimizer for student
     optimizer = torch.optim.Adam(student_model.parameters(), lr=0.001)
@@ -181,8 +325,8 @@ def main():
     # Initialize distiller
     distiller = Distiller(teacher_model, student_model, optimizer, game, device)
     
-    # Run distillation
-    distiller.distill(dataset, batch_size=64, epochs=10)
+    # Run distillation with profiling enabled
+    distiller.distill(dataset, batch_size=64, epochs=10, profile=True)
     
     # Save final student model
     torch.save(student_model.state_dict(), "final_student_model.pt")
