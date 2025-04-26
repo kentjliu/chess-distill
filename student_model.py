@@ -1,5 +1,5 @@
 # Made with help of Claude
-
+# Need to have teacher model saved prior to running this !
 
 import chess
 import random
@@ -11,8 +11,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from policy_model import ChessPolicyNet, encode_fen
 from AlphaZeroChess960 import Chess960Game
-
-
 
 teacher_path = "policy.pth" # change to saved teacher model path
 
