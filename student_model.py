@@ -11,9 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from policy_model import ChessPolicyNet, encode_fen
 from AlphaZeroChess960 import Chess960Game
-import wandb
 import torch.profiler
-import glob
 
 teacher_path = "policy.pth" # change to saved teacher model path
 
@@ -125,19 +123,6 @@ class Distiller:
         return loss.item()
     
     def distill(self, dataset, batch_size=64, epochs=10, profile=False):
-        # Initialize wandb for experiment tracking
-        wandb.init(project="chess-distillation", 
-                  config={
-                      "temperature": self.temperature,
-                      "batch_size": batch_size,
-                      "epochs": epochs,
-                      "student_res_blocks": len(self.student_model.backBone),
-                      "student_hidden_dim": self.student_model.startBlock[0].out_channels
-                  })
-        
-        # Log model architecture
-        wandb.watch(self.student_model, log="all", log_freq=10)
-        
         # Setup profiler
         profile_dir = "tbprofile/"
         
@@ -183,15 +168,6 @@ class Distiller:
                         
                         prof.step()
                 
-                # Create a wandb Artifact for the profile
-                profile_art = wandb.Artifact("trace", type="profile")
-                
-                # Add the trace files to the Artifact
-                for trace_file in glob.glob(profile_dir + "*.pt.trace.json"):
-                    profile_art.add_file(trace_file)
-                
-                # Log the artifact
-                wandb.log_artifact(profile_art)
                 
                 # Print profiler results
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
@@ -222,24 +198,12 @@ class Distiller:
             
             avg_loss = total_loss / batches
             print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}")
-            
-            # Log metrics to wandb
-            wandb.log({
-                "epoch": epoch + 1,
-                "avg_loss": avg_loss,
-            })
-            
+          
             # Save checkpoint
             checkpoint_path = f"student_model_epoch_{epoch+1}.pt"
             torch.save(self.student_model.state_dict(), checkpoint_path)
             
-            # Log model checkpoint to wandb
-            model_artifact = wandb.Artifact(f"model-epoch-{epoch+1}", type="model")
-            model_artifact.add_file(checkpoint_path)
-            wandb.log_artifact(model_artifact)
-        
-        # Close wandb run
-        wandb.finish()
+    
 
 def profile_models(teacher_model, student_model, device):
     """Profile both models to compare FLOPs and parameters"""
