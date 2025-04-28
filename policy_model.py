@@ -175,7 +175,7 @@ if __name__ == '__main__':
         chess_file = '/content/chess960_training_data (3).txt', #change if file is different
         batch_size = 64,
         lr         = .001,
-        epochs     = 5,
+        epochs     = 10,
         device     = device
     )
     path = 'policy.pth'
