@@ -153,7 +153,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     game   = Chess960Game()
     model = ResNet(game).to(device)
-    checkpoint = torch.load('/Users/will/github/chess-distill/az_model_9.pth', map_location=device)
+    checkpoint = torch.load('./models/az_model_toy.pth', map_location=device)
     model.load_state_dict(checkpoint)
     model.eval()
 
