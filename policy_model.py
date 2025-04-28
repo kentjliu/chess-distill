@@ -178,6 +178,6 @@ if __name__ == '__main__':
         epochs     = 10,
         device     = device
     )
-    path = 'policy.pth'
+    path = './models/policy_model.pth'
   # Save the model's state_dict
     torch.save(model.state_dict(), path)
