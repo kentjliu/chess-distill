@@ -300,7 +300,9 @@ class AlphaZero:
             self.model.train()
             self.train(memory)
             # save checkpoint
-            torch.save(self.model.state_dict(), f"az_model_{it}.pt")
+            if it== self.args['num_iterations']%50 or self.args['num_iterations']-1:
+                #Saves a model after every 50 iterations and saves the very last model
+                torch.save(self.model.state_dict(), f"az_model_{it}.pt")
 
 if __name__ == '__main__':
     game = Chess960Game()
@@ -315,8 +317,8 @@ if __name__ == '__main__':
         'epsilon':       0.25,
         'dirichlet_alpha':0.03,
         'batch_size':    64,   # ↓ smaller batch, less training work
-        'num_iterations': 1,   # ← only one cycle
-        'num_selfplay':   1    # ← only one self‐play game
+        'num_iterations': 200,   # ← only one cycle
+        'num_selfplay':   64    # ← only one self‐play game
     }
     az = AlphaZero(model, optimizer, game, args, device)
     az.learn()
