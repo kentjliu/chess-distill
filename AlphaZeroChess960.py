@@ -302,13 +302,13 @@ class AlphaZero:
             # save checkpoint
             if it== self.args['num_iterations']%50 or self.args['num_iterations']-1:
                 #Saves a model after every 50 iterations and saves the very last model
-                torch.save(self.model.state_dict(), f"az_model_{it}.pt")
+                torch.save(self.model.state_dict(), f"./models/az_model_{it}.pth")
 
 if __name__ == '__main__':
     game = Chess960Game()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ResNet(game).to(device)
-    checkpoint = torch.load('/content/model_parameters.pth', map_location=device)
+    checkpoint = torch.load('./models/policy_model.pth', map_location=device)
     model.load_state_dict(checkpoint, strict=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     args = {
