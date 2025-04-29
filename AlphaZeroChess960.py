@@ -255,33 +255,6 @@ class MCTS:
         # Compute improved policy based on visit counts
         improved_policy = np.zeros(self.game.action_size, dtype=np.float32)
         
-        # Temperature parameter to control exploration/exploitation
-        temperature = self.args.get('temperature', 1.0)
-        
-        # If temperature is very close to zero, pick the most visited move
-        if temperature < 0.01:
-            best_action = None
-            best_count = -float('inf')
-            for action, child in root.children.items():
-                if child.visit_count > best_count:
-                    best_count = child.visit_count
-                    best_action = action
-            improved_policy[best_action] = 1.0
-        else:
-            # Otherwise, use visit count distribution with temperature
-            visits = np.array([child.visit_count for action, child in root.children.items()], dtype=np.float32)
-            actions = list(root.children.keys())
-            
-            # Apply temperature
-            if temperature != 1.0:
-                visits = np.power(visits, 1.0 / temperature)
-                
-            # Normalize to get probabilities
-            visits_sum = np.sum(visits)
-            if visits_sum > 0:
-                visits = visits / visits_sum
-                improved_policy[actions] = visits
-        
         return improved_policy
 
 class AlphaZero:
@@ -513,10 +486,6 @@ class AlphaZero:
         for it in range(self.args['num_iterations']):
             print(f"\n===== Iteration {it+1}/{self.args['num_iterations']} =====")
             
-            # Set temperature based on current iteration
-            current_temp = self.get_temperature(it)
-            self.args['temperature'] = current_temp
-            print(f"Current temperature: {current_temp}")
             
             # Run profiling on milestone iterations
             if it % 50 == 0 or it == self.args['num_iterations'] - 1:
@@ -606,9 +575,8 @@ class AlphaZero:
                 # Get move based on which player's turn it is
                 if board.turn == (current_player == 1):  # Current model's turn
                     # Use our trained model with MCTS
-                    temp_args = self.args.copy()
-                    temp_args['temperature'] = 0.1  # More deterministic for validation
-                    mcts = MCTS(self.game, self.model, temp_args, self.device)
+                    
+                    mcts = MCTS(self.game, self.model, self.device)
                     probs = mcts.search(board)
                     action = np.argmax(probs)  # Greedy action selection for validation
                 else:  # Baseline's turn
@@ -619,9 +587,7 @@ class AlphaZero:
                         action = np.random.choice(valid_move_indices)
                     else:
                         # Use baseline model with MCTS
-                        temp_args = self.args.copy()
-                        temp_args['temperature'] = 0.1
-                        baseline_mcts = MCTS(self.game, baseline_model, temp_args, self.device)
+                        baseline_mcts = MCTS(self.game, baseline_model, self.device)
                         probs = baseline_mcts.search(board)
                         action = np.argmax(probs)
                 
