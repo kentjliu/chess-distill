@@ -300,7 +300,7 @@ class AlphaZero:
             self.model.train()
             self.train(memory)
             # save checkpoint
-            if it== self.args['num_iterations']%50 or self.args['num_iterations']-1:
+            if it%50==0 or it==self.args['num_iterations']-1:
                 #Saves a model after every 50 iterations and saves the very last model
                 torch.save(self.model.state_dict(), f"./models/az_model_{it}.pth")
 
