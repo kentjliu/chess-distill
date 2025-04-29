@@ -5,7 +5,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import torch.profiler
+import os
+from datetime import datetime
+#profiling code created using the help of claude and Kavika! 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -41,7 +44,7 @@ class Chess960Game:
             new_board.push(plain)
             return new_board
 
-        # Only consider promotion if it’s a pawn to the back rank
+        # Only consider promotion if it's a pawn to the back rank
         is_pawn      = piece and piece.piece_type == chess.PAWN
         rank_to_back = chess.square_rank(to_sq) in (0, 7)
         if is_pawn and rank_to_back:
@@ -177,8 +180,8 @@ class Node:
             self.parent.backpropagate(-value)
 
 class MCTS:
-    def __init__(self, game, model, args,device):
-        self.device=device
+    def __init__(self, game, model, args, device):
+        self.device = device
         self.game = game
         self.model = model
         self.args = args
@@ -230,13 +233,162 @@ class MCTS:
         return probs
 
 class AlphaZero:
-    def __init__(self, model, optimizer, game, args,device):
-        self.device = next(model.parameters()).device
+    def __init__(self, model, optimizer, game, args, device):
+        self.device = device
         self.model = model
         self.optimizer = optimizer
         self.game = game
         self.args = args
-        self.mcts = MCTS(game, model, args,self.device)
+        self.mcts = MCTS(game, model, args, self.device)
+        
+        # Create profiling directory
+        self.profile_dir = "./profile_results"
+        os.makedirs(self.profile_dir, exist_ok=True)
+
+    def profile_model(self, iteration):
+        """Profile the model to track performance metrics"""
+        print(f"\n[Profiling] Starting model profiling for iteration {iteration}")
+        
+        # Create specific directory for this iteration
+        iter_profile_dir = os.path.join(self.profile_dir, f"iteration_{iteration}")
+        os.makedirs(iter_profile_dir, exist_ok=True)
+        
+        # Create sample input
+        sample_input = torch.randn(1, 18, 8, 8, device=self.device)
+        
+        # Configure profiler schedule
+        schedule = torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=1
+        )
+        
+        # Run profiler
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(iter_profile_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+            with_stack=True
+        ) as prof:
+            # Forward pass
+            for _ in range(5):  # Run multiple times to get better average metrics
+                policy_logits, value = self.model(sample_input)
+                prof.step()
+        
+        # Print profiler results
+        print("\n[Profiling] Model statistics:")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        
+        # Calculate FLOPs
+        total_flops = sum(k.flops for k in prof.key_averages() if k.flops > 0)
+        print(f"[Profiling] Total FLOPs: {total_flops:,}")
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"[Profiling] Total parameters: {total_params:,}")
+        
+        # Save profiling summary to file
+        summary_file = os.path.join(iter_profile_dir, "profile_summary.txt")
+        with open(summary_file, 'w') as f:
+            f.write(f"Profiling summary for iteration {iteration}\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Device: {self.device}\n")
+            f.write(f"Total FLOPs: {total_flops:,}\n")
+            f.write(f"Total parameters: {total_params:,}\n\n")
+            f.write("Top 10 operations by CUDA time:\n")
+            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        
+        print(f"[Profiling] Results saved to {iter_profile_dir}")
+        return prof.key_averages()
+
+    def profile_selfplay(self, iteration):
+        """Profile the self-play process"""
+        print(f"\n[Profiling] Starting self-play profiling for iteration {iteration}")
+        
+        # Create specific directory for this self-play profiling
+        selfplay_profile_dir = os.path.join(self.profile_dir, f"iteration_{iteration}_selfplay")
+        os.makedirs(selfplay_profile_dir, exist_ok=True)
+        
+        # Configure profiler schedule - more steps for self-play
+        schedule = torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=5,  # More active steps to capture full game behavior
+            repeat=1
+        )
+        
+        # Run profiler during a self-play game
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(selfplay_profile_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+            with_stack=True
+        ) as prof:
+            # Start a self-play game with profiling
+            # We'll just run a few moves to avoid overloading the profiler
+            board = self.game.get_initial_state()
+            print("[Profiling] ⮕ Starting profiled game")
+            print(f"[Profiling]    Initial FEN: {board.fen()}")
+            
+            # Play 10 moves or until game ends
+            for move_num in range(10):
+                prof.step()  # Step the profiler
+                
+                # Get move from MCTS
+                probs = self.mcts.search(board)
+                action = np.random.choice(self.game.action_size, p=probs)
+                
+                # Convert to chess move
+                from_sq = action // 64
+                to_sq = action % 64
+                move = chess.Move(from_sq, to_sq)
+                if move not in board.legal_moves:
+                    # Try queen promo
+                    move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
+                
+                print(f"[Profiling] ⮕ Move {move_num+1}: {move.uci()}")
+                
+                # Make the move
+                try:
+                    board = self.game.get_next_state(board, action)
+                except ValueError:
+                    print("[Profiling] Illegal move encountered, ending profiled game")
+                    break
+                
+                # Check if game is over
+                value, done = self.game.get_value_and_terminated(board)
+                if done:
+                    print("[Profiling] Game ended during profiling")
+                    break
+        
+        # Print profiler results
+        print("\n[Profiling] Self-play statistics:")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        
+        # Save profiling summary to file
+        summary_file = os.path.join(selfplay_profile_dir, "selfplay_profile_summary.txt")
+        with open(summary_file, 'w') as f:
+            f.write(f"Self-play profiling summary for iteration {iteration}\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Device: {self.device}\n\n")
+            f.write("Top 10 operations by CUDA time:\n")
+            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        
+        print(f"[Profiling] Self-play results saved to {selfplay_profile_dir}")
+        return prof.key_averages()
 
     def self_play(self):
         memory = []
@@ -256,7 +408,7 @@ class AlphaZero:
             to_sq   = action % 64
             move = chess.Move(from_sq, to_sq)
             if move not in state.legal_moves:
-                # try queen promo if it’s a pawn promotion
+                # try queen promo if it's a pawn promotion
                 move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
 
             print(f"⮕ Player {'White' if player_turn else 'Black'} plays {move.uci()}")
@@ -289,27 +441,79 @@ class AlphaZero:
             logits, val = self.model(states)
             loss_p = -torch.mean(torch.sum(pis * F.log_softmax(logits, dim=1), dim=1))
             loss_v = F.mse_loss(val, vs)
-            (loss_p + loss_v).backward()
+            total_loss = loss_p + loss_v
+            total_loss.backward()
             self.optimizer.step()
+            
+            # Return the loss values for tracking
+            return {"policy_loss": loss_p.item(), "value_loss": loss_v.item(), "total_loss": total_loss.item()}
 
     def learn(self):
+        # Create a log file for training metrics
+        log_file = os.path.join(self.profile_dir, "training_log.csv")
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        
+        # Initialize log file with header
+        with open(log_file, 'w') as f:
+            f.write("iteration,policy_loss,value_loss,total_loss\n")
+        
         for it in range(self.args['num_iterations']):
+            print(f"\n===== Iteration {it+1}/{self.args['num_iterations']} =====")
+            
+            # Run profiling on milestone iterations
+            if it % 50 == 0 or it == self.args['num_iterations'] - 1:
+                print(f"\n----- Running profiling at iteration {it} -----")
+                # Profile the model
+                self.profile_model(it)
+                # Profile self-play
+                self.profile_selfplay(it)
+            
+            # Regular training process
             memory = []
-            for _ in range(self.args['num_selfplay']):
+            for sp_idx in range(self.args['num_selfplay']):
+                print(f"\nSelf-play game {sp_idx+1}/{self.args['num_selfplay']}")
                 memory.extend(self.self_play())
+            
+            # Train on collected experiences
+            print(f"\nTraining on {len(memory)} examples...")
             self.model.train()
-            self.train(memory)
-            # save checkpoint
-            if it%50==0 or it==self.args['num_iterations']-1:
-                #Saves a model after every 50 iterations and saves the very last model
-                torch.save(self.model.state_dict(), f"./models/az_model_{it}.pth")
+            losses = self.train(memory)
+            
+            # Log training metrics
+            with open(log_file, 'a') as f:
+                f.write(f"{it},{losses['policy_loss']},{losses['value_loss']},{losses['total_loss']}\n")
+            
+            print(f"Training complete. Losses: Policy={losses['policy_loss']:.4f}, Value={losses['value_loss']:.4f}, Total={losses['total_loss']:.4f}")
+            
+            # Save checkpoint
+            if it % 50 == 0 or it == self.args['num_iterations'] - 1:
+                # Saves a model after every 50 iterations and saves the very last model
+                model_path = f"./models/az_model_{it}.pth"
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                torch.save(self.model.state_dict(), model_path)
+                print(f"Model saved to {model_path}")
+        
+        print("\n===== Training complete =====")
 
 if __name__ == '__main__':
+    # Ensure output directories exist
+    os.makedirs("./models", exist_ok=True)
+    os.makedirs("./profile_results", exist_ok=True)
+    
     game = Chess960Game()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     model = ResNet(game).to(device)
-    checkpoint = torch.load('./models/policy_model.pth', map_location=device)
-    model.load_state_dict(checkpoint, strict=False)
+    
+    # Load pre-trained policy model if exists
+    try:
+        checkpoint = torch.load('./models/policy_model.pth', map_location=device)
+        model.load_state_dict(checkpoint, strict=False)
+        print("Loaded pre-trained policy model")
+    except FileNotFoundError:
+        print("No pre-trained policy model found, starting from scratch")
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     args = {
         'C':              1.4,
@@ -320,5 +524,13 @@ if __name__ == '__main__':
         'num_iterations': 200,   # ← only one cycle
         'num_selfplay':   64    # ← only one self‐play game
     }
+    
+    # Create and run AlphaZero
     az = AlphaZero(model, optimizer, game, args, device)
+    
+    # Before learning, profile the initial model
+    print("\n===== Initial model profiling =====")
+    az.profile_model("initial")
+    
+    # Start learning process
     az.learn()
