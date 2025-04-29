@@ -209,53 +209,34 @@ class MCTS:
         # dirichlet noise
         noise = np.random.dirichlet([self.args['dirichlet_alpha']] * self.game.action_size)
         policy = (1 - self.args['epsilon']) * policy + self.args['epsilon'] * noise
-        valid = self.game.get_valid_moves(state)  # Get valid moves again to be sure
+        valid  = self.game.get_valid_moves(state)
         policy = renormalize(policy, valid)
         root.expand(policy)
 
         for _ in range(self.args['num_searches']):
             node = root
-            search_path = [node]
-            
-            # Selection phase - traverse the tree to a leaf node
+            # selection & expansion
             while node.is_expanded():
-                action, node = node.select(self.args['C'])
-                search_path.append(node)
-            
-            # Check if terminal state
-            value, done = self.game.get_value_and_terminated(node.state)
-            
-            # Expansion and evaluation phase
+                a, node = node.select(self.args['C'])
+            v, done = self.game.get_value_and_terminated(node.state)
             if not done:
-                # Get the board from current player's perspective
                 board = self.game.change_perspective(node.state)
-                encoded = self.game.get_encoded_state(board)
-                tensor_state = torch.tensor(encoded, dtype=torch.float32, device=self.device).unsqueeze(0)
-                
-                # Neural network evaluation
-                policy_logits, value_tensor = self.model(tensor_state)
-                policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-                
-                # Apply valid move mask
-                valid_moves = self.game.get_valid_moves(node.state)
-                policy = renormalize(policy, valid_moves)
-                
-                # Expand node with new policy
-                node.expand(policy)
-                
-                # Use value from neural network
-                value = value_tensor.item()
-            
-            # Backpropagation phase - update all nodes in the search path
-            for node in reversed(search_path):
-                node.value_sum += value if node.state.turn == search_path[-1].state.turn else -value
-                node.visit_count += 1
-                value = -value  # Flip value for opponent
+                enc = self.game.get_encoded_state(board)
+                enc_tensor = torch.tensor(enc, dtype=torch.float32, device=self.device).unsqueeze(0)
+                p_logits, v_tensor = self.model(enc_tensor)
+                p = F.softmax(p_logits, dim=1).squeeze(0).cpu().numpy()
+                p = p * self.game.get_valid_moves(node.state)
+                p = renormalize(p, valid)
+                node.expand(p)
+                v = v_tensor.item()
+            node.backpropagate(v)
 
-        # Compute improved policy based on visit counts
-        improved_policy = np.zeros(self.game.action_size, dtype=np.float32)
-        
-        return improved_policy
+        # compute action probabilities
+        visits = np.array([child.visit_count for child in root.children.values()], dtype=np.float32)
+        actions = list(root.children.keys())
+        probs = np.zeros(self.game.action_size, dtype=np.float32)
+        probs[actions] = visits / np.sum(visits)
+        return probs
 
 class AlphaZero:
     def __init__(self, model, optimizer, game, args, device):
@@ -478,14 +459,10 @@ class AlphaZero:
         
         # Initialize log file with header
         with open(log_file, 'w') as f:
-            f.write("iteration,policy_loss,value_loss,total_loss,validation_win_rate,avg_game_length\n")
-        
-        # Keep track of best model
-        best_win_rate = 0.0
+            f.write("iteration,policy_loss,value_loss,total_loss\n")
         
         for it in range(self.args['num_iterations']):
             print(f"\n===== Iteration {it+1}/{self.args['num_iterations']} =====")
-            
             
             # Run profiling on milestone iterations
             if it % 50 == 0 or it == self.args['num_iterations'] - 1:
@@ -497,135 +474,30 @@ class AlphaZero:
             
             # Regular training process
             memory = []
-            avg_game_length = 0
-            
-            # Collect self-play games
             for sp_idx in range(self.args['num_selfplay']):
                 print(f"\nSelf-play game {sp_idx+1}/{self.args['num_selfplay']}")
-                game_memory = self.self_play()
-                memory.extend(game_memory)
-                avg_game_length += len(game_memory)
-            
-            if self.args['num_selfplay'] > 0:
-                avg_game_length /= self.args['num_selfplay']
-                print(f"Average game length: {avg_game_length:.1f} moves")
+                memory.extend(self.self_play())
             
             # Train on collected experiences
             print(f"\nTraining on {len(memory)} examples...")
             self.model.train()
             losses = self.train(memory)
             
-            # Validation: play against previous best version or random policy
-            if it % 10 == 0:
-                win_rate = self.validate(num_games=20)
-                print(f"Validation win rate: {win_rate:.2f}")
-                
-                # Save best model
-                if win_rate > best_win_rate:
-                    best_win_rate = win_rate
-                    torch.save(self.model.state_dict(), f"./models/4_az_best_model.pth")
-                    print(f"New best model saved with win rate: {best_win_rate:.2f}")
-            else:
-                win_rate = 0  # No validation this iteration
-            
             # Log training metrics
             with open(log_file, 'a') as f:
-                f.write(f"{it},{losses['policy_loss']:.6f},{losses['value_loss']:.6f},{losses['total_loss']:.6f},{win_rate:.4f},{avg_game_length:.1f}\n")
+                f.write(f"{it},{losses['policy_loss']},{losses['value_loss']},{losses['total_loss']}\n")
             
             print(f"Training complete. Losses: Policy={losses['policy_loss']:.4f}, Value={losses['value_loss']:.4f}, Total={losses['total_loss']:.4f}")
             
             # Save checkpoint
-            if it % self.args['checkpoint_freq'] == 0 or it == self.args['num_iterations'] - 1:
+            if it % 5 == 0 or it == self.args['num_iterations'] - 1:
+                # Saves a model after every 50 iterations and saves the very last model
                 model_path = f"./models/4_az_model_{it}.pth"
                 os.makedirs(os.path.dirname(model_path), exist_ok=True)
                 torch.save(self.model.state_dict(), model_path)
                 print(f"Model saved to {model_path}")
         
         print("\n===== Training complete =====")
-        print(f"Best validation win rate: {best_win_rate:.2f}")
-
-    def validate(self, num_games=20):
-        """
-        Validate the current model by playing against a baseline policy
-        Returns win rate against the baseline
-        """
-        print(f"\n----- Validating model over {num_games} games -----")
-        wins, losses, draws = 0, 0, 0
-        
-        # Create a copy of the current model as the opponent
-        baseline_model = ResNet(self.game).to(self.device)
-        
-        # Try to load previous best model if it exists
-        baseline_path = "./models/4_az_previous_best.pth"
-        try:
-            baseline_model.load_state_dict(torch.load(baseline_path, map_location=self.device))
-            print("Validating against previous best model")
-            use_random_policy = False
-        except FileNotFoundError:
-            print("No previous best model found, validating against random policy")
-            use_random_policy = True
-        
-        self.model.eval()  # Set model to evaluation mode
-        
-        for game_idx in range(num_games):
-            board = self.game.get_initial_state()
-            current_player = 1  # 1 for current model, -1 for baseline
-            
-            while True:
-                # Get move based on which player's turn it is
-                if board.turn == (current_player == 1):  # Current model's turn
-                    # Use our trained model with MCTS
-                    
-                    mcts = MCTS(self.game, self.model, self.device)
-                    probs = mcts.search(board)
-                    action = np.argmax(probs)  # Greedy action selection for validation
-                else:  # Baseline's turn
-                    if use_random_policy:
-                        # Random policy for baseline
-                        valid_moves = self.game.get_valid_moves(board)
-                        valid_move_indices = np.where(valid_moves == 1)[0]
-                        action = np.random.choice(valid_move_indices)
-                    else:
-                        # Use baseline model with MCTS
-                        baseline_mcts = MCTS(self.game, baseline_model, self.device)
-                        probs = baseline_mcts.search(board)
-                        action = np.argmax(probs)
-                
-                # Make move
-                try:
-                    board = self.game.get_next_state(board, action)
-                except ValueError:
-                    print(f"Invalid move in validation game {game_idx+1}")
-                    if board.turn == (current_player == 1):
-                        losses += 1
-                    else:
-                        wins += 1
-                    break
-                
-                # Check if game is over
-                value, done = self.game.get_value_and_terminated(board)
-                if done:
-                    if value == 0:
-                        draws += 1
-                    elif (value > 0 and current_player == 1) or (value < 0 and current_player == -1):
-                        wins += 1
-                    else:
-                        losses += 1
-                    break
-            
-            # Print progress
-            if (game_idx + 1) % 5 == 0:
-                print(f"Validation progress: {game_idx + 1}/{num_games} games completed")
-        
-        print(f"Validation results: {wins} wins, {losses} losses, {draws} draws")
-        win_rate = (wins + 0.5 * draws) / num_games
-        
-        # Save the current model as the previous best for future comparisons
-        if win_rate > 0.55:  # Only if it's significantly better
-            torch.save(self.model.state_dict(), baseline_path)
-            print("Current model saved as new baseline")
-        
-        return win_rate
 
 if __name__ == '__main__':
     # Ensure output directories exist
