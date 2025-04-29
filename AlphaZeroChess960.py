@@ -11,14 +11,14 @@ from datetime import datetime
 #profiling code created using the help of claude and Kavika! 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def renormalize(policy: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    # zero out any negative scores and illegal moves
+def renormalize(policy: np.ndarray, valid: np.ndarray):
+    # zero out illegal moves
     policy = np.clip(policy, 0, None) * valid
     s = policy.sum()
     if s <= 0 or np.isnan(s):
         # fallback: uniform over valid moves
         policy = valid.astype(np.float32)
-        s = policy.sum()  # assume there's at least one legal move
+        s = policy.sum()  # guaranteed >0 if there's at least one legal move
     return policy / s
 # --- Chess960 game definition ---
 class Chess960Game:
@@ -190,52 +190,61 @@ class Node:
 class MCTS:
     def __init__(self, game, model, args, device):
         self.device = device
-        self.game = game
-        self.model = model
-        self.args = args
+        self.game   = game
+        self.model  = model
+        self.args   = args
 
     @torch.no_grad()
     def search(self, state):
         root = Node(self.game, state)
-        # initial policy + noise
+
+        # --- root expand ---
         board = self.game.change_perspective(state)
         encoded = self.game.get_encoded_state(board)
         x = torch.tensor(encoded, dtype=torch.float32, device=self.device).unsqueeze(0)
-        policy_logits, value = self.model(x)
+        policy_logits, _ = self.model(x)
         policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-        # mask
-        valid = self.game.get_valid_moves(state)
-        policy = renormalize(policy, valid)
-        # dirichlet noise
-        noise = np.random.dirichlet([self.args['dirichlet_alpha']] * self.game.action_size)
+
+        valid_root = self.game.get_valid_moves(state)
+        policy = renormalize(policy, valid_root)
+
+        # add Dirichlet noise
+        noise  = np.random.dirichlet([self.args['dirichlet_alpha']] * self.game.action_size)
         policy = (1 - self.args['epsilon']) * policy + self.args['epsilon'] * noise
-        valid  = self.game.get_valid_moves(state)
-        policy = renormalize(policy, valid)
+        policy = renormalize(policy, valid_root)
         root.expand(policy)
 
+        # --- tree search loops ---
         for _ in range(self.args['num_searches']):
             node = root
-            # selection & expansion
+            # traverse down to a leaf
             while node.is_expanded():
-                a, node = node.select(self.args['C'])
+                _, node = node.select(self.args['C'])
+
             v, done = self.game.get_value_and_terminated(node.state)
             if not done:
+                # expand this leaf
                 board = self.game.change_perspective(node.state)
-                enc = self.game.get_encoded_state(board)
-                enc_tensor = torch.tensor(enc, dtype=torch.float32, device=self.device).unsqueeze(0)
-                p_logits, v_tensor = self.model(enc_tensor)
+                enc   = self.game.get_encoded_state(board)
+                xt    = torch.tensor(enc, dtype=torch.float32, device=self.device).unsqueeze(0)
+                p_logits, v_tensor = self.model(xt)
+
+                # mask & renormalize with node-specific valid moves
                 p = F.softmax(p_logits, dim=1).squeeze(0).cpu().numpy()
-                p = p * self.game.get_valid_moves(node.state)
-                p = renormalize(p, valid)
+                valid_node = self.game.get_valid_moves(node.state)
+                p = renormalize(p * valid_node, valid_node)
+
                 node.expand(p)
                 v = v_tensor.item()
+
             node.backpropagate(v)
 
-        # compute action probabilities
-        visits = np.array([child.visit_count for child in root.children.values()], dtype=np.float32)
+        # collect visit probabilities from root children
+        visits  = np.array([child.visit_count for child in root.children.values()], dtype=np.float32)
         actions = list(root.children.keys())
-        probs = np.zeros(self.game.action_size, dtype=np.float32)
-        probs[actions] = visits / np.sum(visits)
+        probs   = np.zeros(self.game.action_size, dtype=np.float32)
+        if visits.sum() > 0:
+            probs[actions] = visits / visits.sum()
         return probs
 
 class AlphaZero:
@@ -449,8 +458,7 @@ class AlphaZero:
             total_loss.backward()
             self.optimizer.step()
             
-            # Return the loss values for tracking
-            return {"policy_loss": loss_p.item(), "value_loss": loss_v.item(), "total_loss": total_loss.item()}
+        return {"policy_loss": loss_p.item(), "value_loss": loss_v.item(), "total_loss": total_loss.item()}
 
     def learn(self):
         # Create a log file for training metrics
