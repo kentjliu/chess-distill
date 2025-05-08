@@ -11,6 +11,9 @@ from datetime import datetime
 #profiling code created using the help of claude and Kavika! 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+
+
 def renormalize(policy: np.ndarray, valid: np.ndarray):
     # zero out illegal moves
     policy = np.clip(policy, 0, None) * valid
@@ -161,13 +164,16 @@ class Node:
     def is_expanded(self):
         return len(self.children) > 0
 
-    def expand(self, policy):
-        for a, p in enumerate(policy):
-            if p > 0:
-                self.children[a] = Node(self.game,
-                                        self.game.get_next_state(self.state, a),
-                                        parent=self,
-                                        prior=p)
+    def expand(self, policy: torch.Tensor):
+        # policy: 1‐D float Tensor on either CPU or CUDA
+        nz = (policy > 0).nonzero(as_tuple=False).squeeze(1)
+        for a in nz.tolist():
+            self.children[a] = Node(
+                self.game,
+                self.game.get_next_state(self.state, a),
+                parent=self,
+                prior=policy[a].item()
+            )
 
     def select(self, C):
         best_score = -float('inf')
@@ -187,65 +193,75 @@ class Node:
         if self.parent:
             self.parent.backpropagate(-value)
 
+from torch.distributions import Dirichlet
+
+def masked_softmax(logits: torch.Tensor, valid_mask: torch.Tensor, dim: int = -1):
+    neg_inf = torch.finfo(logits.dtype).min
+    logits = logits.masked_fill(valid_mask == 0, neg_inf)
+    return F.softmax(logits, dim=dim)
+
+
+
 class MCTS:
     def __init__(self, game, model, args, device):
-        self.device = device
         self.game   = game
         self.model  = model
         self.args   = args
+        self.device = device
 
-    @torch.no_grad()
-    def search(self, state):
+    def search(self, state: chess.Board):
         root = Node(self.game, state)
 
-        # --- root expand ---
-        board = self.game.change_perspective(state)
-        encoded = self.game.get_encoded_state(board)
-        x = torch.tensor(encoded, dtype=torch.float32, device=self.device).unsqueeze(0)
-        policy_logits, _ = self.model(x)
-        policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-
-        valid_root = self.game.get_valid_moves(state)
-        policy = renormalize(policy, valid_root)
-
-        # add Dirichlet noise
-        noise  = np.random.dirichlet([self.args['dirichlet_alpha']] * self.game.action_size)
-        policy = (1 - self.args['epsilon']) * policy + self.args['epsilon'] * noise
-        policy = renormalize(policy, valid_root)
-        root.expand(policy)
-
-        # --- tree search loops ---
+        leaves = []
         for _ in range(self.args['num_searches']):
             node = root
-            # traverse down to a leaf
             while node.is_expanded():
                 _, node = node.select(self.args['C'])
+            leaves.append(node)
 
-            v, done = self.game.get_value_and_terminated(node.state)
-            if not done:
-                # expand this leaf
-                board = self.game.change_perspective(node.state)
-                enc   = self.game.get_encoded_state(board)
-                xt    = torch.tensor(enc, dtype=torch.float32, device=self.device).unsqueeze(0)
-                p_logits, v_tensor = self.model(xt)
+        # 2. Batch-encode states and masks
+        encs  = [ self.game.get_encoded_state(self.game.change_perspective(n.state)) for n in leaves ]
+        masks = [ self.game.get_valid_moves(n.state) for n in leaves ]
+        batch_x     = torch.from_numpy(np.stack(encs)).to(self.device)    # [N×18×8×8]
+        batch_masks = torch.from_numpy(np.stack(masks)).to(self.device)   # [N×4096]
 
-                # mask & renormalize with node-specific valid moves
-                p = F.softmax(p_logits, dim=1).squeeze(0).cpu().numpy()
-                valid_node = self.game.get_valid_moves(node.state)
-                p = renormalize(p * valid_node, valid_node)
+        # 3. Single batched inference
+        with torch.no_grad():
+            batch_logits, batch_values = self.model(batch_x)                    # [N×4096], [N×1]
+            batch_policies = masked_softmax(batch_logits, batch_masks, dim=1)   # [N×4096]
 
-                node.expand(p)
-                v = v_tensor.item()
+        # 4. Expand and backpropagate all leaves in one go
+        for node, policy_row, value in zip(leaves, batch_policies, batch_values):
+            node.expand(policy_row)               # GPU tensor passed directly
+            node.backpropagate(value.item())
 
-            node.backpropagate(v)
-
-        # collect visit probabilities from root children
-        visits  = np.array([child.visit_count for child in root.children.values()], dtype=np.float32)
+        # --- final visit‐count → GPU tensor of probs ---
+        visit_counts = torch.tensor(
+        [child.visit_count for child in root.children.values()],
+        dtype=torch.float32,
+        device=self.device
+        )
         actions = list(root.children.keys())
-        probs   = np.zeros(self.game.action_size, dtype=np.float32)
-        if visits.sum() > 0:
-            probs[actions] = visits / visits.sum()
-        return probs
+
+        # 1) prepare an all‐zero probs
+        probs = torch.zeros(self.game.action_size, device=self.device)
+
+        if visit_counts.sum() > 0:
+            # normal case: use visit‐count frequencies
+            visit_counts /= visit_counts.sum()
+            probs[actions] = visit_counts
+        else:
+            # fallback: uniform over valid moves
+            valid = torch.from_numpy(self.game.get_valid_moves(root.state))\
+                        .to(self.device).float()
+            valid_sum = valid.sum()
+            if valid_sum > 0:
+                probs = valid / valid_sum
+            else:
+                # (should never happen: at least one legal move always exists)
+                probs[:] = 1.0 / self.game.action_size
+
+        return probs  
 
 class AlphaZero:
     def __init__(self, model, optimizer, game, args, device):
@@ -364,7 +380,8 @@ class AlphaZero:
                 
                 # Get move from MCTS
                 probs = self.mcts.search(board)
-                action = np.random.choice(self.game.action_size, p=probs)
+                action_tensor = torch.multinomial(probs, num_samples=1)   # tensor([1234], device='cuda:0')
+                action = action_tensor.item()   
                 
                 # Convert to chess move
                 from_sq = action // 64
@@ -416,7 +433,8 @@ class AlphaZero:
             probs = self.mcts.search(state)
 
             # pick move
-            action = np.random.choice(self.game.action_size, p=probs)
+            action_tensor = torch.multinomial(probs, num_samples=1)   # tensor([1234], device='cuda:0')
+            action = action_tensor.item()   
 
             # reconstruct the Move object (including pawn promotions)
             from_sq = action // 64
@@ -447,9 +465,16 @@ class AlphaZero:
         for i in range(0, len(memory), self.args['batch_size']):
             batch = memory[i:i+self.args['batch_size']]
             states, pis, vs = zip(*batch)
+
+            # states: still need np→torch conversion
             states = torch.tensor(np.stack(states), dtype=torch.float32, device=self.device)
-            pis = torch.tensor(np.stack(pis), dtype=torch.float32, device=self.device)
+
+            # policies: already torch on GPU, so just stack
+            pis = torch.stack(pis, dim=0)  # <--- this replaces your np.stack line
+
+            # values: a tiny list of floats, so can stay as is
             vs = torch.tensor(vs, dtype=torch.float32, device=self.device).unsqueeze(1)
+
             self.optimizer.zero_grad()
             logits, val = self.model(states)
             loss_p = -torch.mean(torch.sum(pis * F.log_softmax(logits, dim=1), dim=1))
@@ -457,8 +482,13 @@ class AlphaZero:
             total_loss = loss_p + loss_v
             total_loss.backward()
             self.optimizer.step()
-            
-        return {"policy_loss": loss_p.item(), "value_loss": loss_v.item(), "total_loss": total_loss.item()}
+
+        return {
+        "policy_loss": loss_p.item(),
+        "value_loss":  loss_v.item(),
+        "total_loss":  total_loss.item(),
+        }
+
 
     def learn(self):
         # Create a log file for training metrics
@@ -529,10 +559,10 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     args = {
         'C':              1.4,
-        'num_searches':   5,   # ← very few rollouts per move
+        'num_searches':   10,   # ← very few rollouts per move
         'epsilon':       0.25,
         'dirichlet_alpha':0.03,
-        'batch_size':    64,   # ↓ smaller batch, less training work
+        'batch_size':    1024,   # ↓ smaller batch, less training work
         'num_iterations': 100,   # ← only one cycle
         'num_selfplay':   32    # ← only one self‐play game
     }
