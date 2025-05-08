@@ -13,7 +13,7 @@ from policy_model import ChessPolicyNet, encode_fen
 from AlphaZeroChess960 import Chess960Game
 import torch.profiler
 
-teacher_path = "policy.pth" # change to saved teacher model path
+teacher_path = "/home/wf2322/chess-distill/models/4_az_model_30.pth" # change to saved teacher model path
 
 class ResBlock(nn.Module):
     def __init__(self, num_hidden):
@@ -257,12 +257,16 @@ def main():
     
     # Load teacher model (ChessPolicyNet)
     teacher_model = ChessPolicyNet().to(device)
-    teacher_checkpoint = torch.load(teacher_path, map_location=device)
-    teacher_model.load_state_dict(teacher_checkpoint)
+    ckpt = torch.load(teacher_path, map_location=device)
+
+    # drop the value‑head keys
+    ckpt = {k: v for k, v in ckpt.items() if not k.startswith("valueHead")}
+
+    teacher_model.load_state_dict(ckpt)   # strict=True
     teacher_model.eval()  # Set to evaluation mode
     
     # Create student model (smaller)
-    student_model = StudentModel(game, num_resBlocks=2, num_hidden=64).to(device)
+    student_model = StudentModel(game, num_resBlocks=16, num_hidden=64).to(device)
     
     # Profile both models before training
     teacher_stats, student_stats = profile_models(teacher_model, student_model, device)
