@@ -530,7 +530,7 @@ class AlphaZero:
             # Save checkpoint
             if it % 5 == 0 or it == self.args['num_iterations'] - 1:
                 # Saves a model after every 50 iterations and saves the very last model
-                model_path = f"./models/4_az_model_{it}.pth"
+                model_path = f"./models/AZ_Model_{it}.pth"
                 os.makedirs(os.path.dirname(model_path), exist_ok=True)
                 torch.save(self.model.state_dict(), model_path)
                 print(f"Model saved to {model_path}")
@@ -550,7 +550,7 @@ if __name__ == '__main__':
     
     # Load pre-trained policy model if exists
     try:
-        checkpoint = torch.load('./models/policy_model_5.pth', map_location=device)
+        checkpoint = torch.load('./models/policy_model.pth', map_location=device)
         model.load_state_dict(checkpoint, strict=False)
         print("Loaded pre-trained policy model")
     except FileNotFoundError:
